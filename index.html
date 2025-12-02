@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>6x6 Class Seating Tracker</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Use Inter font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7fafc;
+        }
+        .seat {
+            transition: all 0.1s ease-in-out;
+            cursor: pointer;
+            user-select: none;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+            height: 100px; /* Fixed height for consistent grid cells */
+        }
+        .seat:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.05);
+        }
+        .seat:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+        }
+        /* Custom scrollbar for better appearance */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #e2e8f0;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #94a3b8;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+    </style>
+    <!-- Firebase SDK Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, updateDoc, collection, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Enable debug logging for Firestore
+        setLogLevel('Debug');
+
+        // --- GLOBAL SETUP ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : undefined;
+
+        const ROWS = 6;
+        const COLS = 6;
+        const NUM_SEATS = ROWS * COLS;
+        
+        let db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        let currentScores = {}; // Holds all student data (name, seat, score) keyed by seatId
+
+        // Define collection paths
+        const getScoresDocRef = (uid) => {
+            const path = `/artifacts/${appId}/users/${uid}/class_data`;
+            // Store configuration and scores in a single document
+            return doc(collection(db, path), 'seating_chart');
+        };
+        
+        // --- DATA UTILITIES ---
+        
+        /** Generates a default 6x6 student arrangement. */
+        const generateDefaultStudents = () => {
+            return Array.from({ length: NUM_SEATS }, (_, i) => {
+                const row = Math.floor(i / COLS) + 1;
+                const col = (i % COLS) + 1;
+                const seatId = `R${row}C${col}`;
+                return {
+                    seatId: seatId,
+                    seat: i + 1,
+                    name: `Student ${String.fromCharCode(65 + i % 26)}${Math.floor(i / 26) + 1}`,
+                    score: 0
+                };
+            });
+        };
+
+        /** * Parses a CSV string (Seat,Name) into a student array.
+         * Assumes the CSV has a header row and columns 'Seat' (number) and 'Name' (string).
+         */
+        const parseCSV = (csv) => {
+            const lines = csv.trim().split(/\r?\n/);
+            if (lines.length < 2) throw new Error("CSV is empty or missing data.");
+            
+            const headers = lines[0].split(',').map(h => h.trim());
+            const seatIndex = headers.indexOf('Seat');
+            const nameIndex = headers.indexOf('Name');
+
+            if (seatIndex === -1 || nameIndex === -1) {
+                throw new Error("CSV must contain 'Seat' and 'Name' headers.");
+            }
+
+            const students = [];
+            for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',');
+                const seatNumber = parseInt(values[seatIndex]?.trim(), 10);
+                const name = values[nameIndex]?.trim().replace(/"/g, '') || 'N/A'; // Remove quotes from names
+
+                if (!isNaN(seatNumber) && name && seatNumber >= 1 && seatNumber <= NUM_SEATS) {
+                    const student = students.find(s => s.seat === seatNumber);
+                    if (!student) {
+                        // We use the numerical seat number to assign a consistent seatId based on the grid order
+                        const seatIndex = seatNumber - 1;
+                        const row = Math.floor(seatIndex / COLS) + 1;
+                        const col = (seatIndex % COLS) + 1;
+
+                        students.push({
+                            seatId: `R${row}C${col}`,
+                            seat: seatNumber,
+                            name: name,
+                            score: 0
+                        });
+                    }
+                }
+            }
+
+            if (students.length === 0) throw new Error("No valid student data found in the CSV.");
+            
+            // Pad with empty seats if less than NUM_SEATS
+            const studentMap = students.reduce((acc, s) => { acc[s.seat] = s; return acc; }, {});
+            const finalStudents = generateDefaultStudents().map(defaultSeat => {
+                return studentMap[defaultSeat.seat] || defaultSeat; // Use uploaded data, or keep default structure
+            });
+
+            return finalStudents;
+        };
+
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+        window.onload = async () => {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            const statusEl = document.getElementById('status-message');
+            const userIdEl = document.getElementById('user-id');
+
+            // Handle Authentication
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    isAuthReady = true;
+                    statusEl.textContent = 'Status: Ready';
+                    userIdEl.textContent = `User ID: ${userId}`;
+                    
+                    // Start listening for score changes
+                    setupScoreListener();
+                    
+                } else {
+                    statusEl.textContent = 'Status: Signing in...';
+                    userIdEl.textContent = 'User ID: N/A';
+                    
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                        } else {
+                            await signInAnonymously(auth);
+                        }
+                    } catch (error) {
+                        console.error("Firebase sign-in failed:", error);
+                        statusEl.textContent = `Status: Error - ${error.message}`;
+                    }
+                }
+            });
+
+            // Set up event listeners
+            document.getElementById('dismiss-btn').addEventListener('click', exportToCSV);
+            document.getElementById('load-arrangement-btn').addEventListener('click', handleFileLoad);
+        };
+
+
+        // --- FIRESTORE OPERATIONS ---
+        const setupScoreListener = () => {
+            if (!db || !userId) return;
+
+            const docRef = getScoresDocRef(userId);
+
+            // Set up real-time listener
+            onSnapshot(docRef, async (docSnap) => {
+                if (docSnap.exists()) {
+                    // Update local scores with data from Firestore
+                    // The Firestore document now stores the entire configuration + scores
+                    currentScores = docSnap.data();
+                    console.log("Scores updated from Firestore:", currentScores);
+                    renderSeatingChart();
+                } else {
+                    // Document doesn't exist, initialize it with default data
+                    console.log("Document not found. Initializing with default mock data.");
+                    await initializeScores(generateDefaultStudents());
+                }
+            }, (error) => {
+                console.error("Error listening to Firestore:", error);
+                document.getElementById('status-message').textContent = `Status: Listener Error - ${error.message}`;
+            });
+        };
+
+        const initializeScores = async (students) => {
+            if (!db || !userId) return;
+            const docRef = getScoresDocRef(userId);
+            
+            // Create the data structure keyed by seatId
+            const initialData = students.reduce((acc, student) => {
+                acc[student.seatId] = {
+                    name: student.name,
+                    seat: student.seat,
+                    score: student.score || 0 // Use existing score if available, otherwise 0
+                };
+                return acc;
+            }, {});
+            
+            try {
+                await setDoc(docRef, initialData);
+                console.log("Scores written to Firestore.");
+            } catch (error) {
+                console.error("Error writing scores:", error);
+                alertModal("Firestore Error", `Could not save arrangement: ${error.message}`);
+            }
+        };
+
+
+        window.updateScore = async (seatId) => {
+            if (!db || !userId || !isAuthReady) {
+                console.error("App not ready or user not authenticated.");
+                return;
+            }
+            if (!currentScores[seatId] || currentScores[seatId].name === 'N/A') {
+                 alertModal("Empty Seat", "This seat is empty or unassigned and cannot receive points.");
+                 return;
+            }
+
+            const docRef = getScoresDocRef(userId);
+            const currentScore = currentScores[seatId]?.score || 0;
+            const newScore = currentScore + 1;
+            
+            try {
+                // Use a dynamic field path to update only the specific student's score
+                await updateDoc(docRef, {
+                    [`${seatId}.score`]: newScore
+                });
+            } catch (error) {
+                console.error("Error updating score:", error);
+                document.getElementById('status-message').textContent = `Status: Update Failed - ${error.message}`;
+            }
+        };
+
+
+        // --- FILE UPLOAD LOGIC ---
+        const handleFileLoad = () => {
+            const fileInput = document.getElementById('csv-file-input');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alertModal("No File Selected", "Please select a CSV file to upload the seating arrangement.");
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    const csvContent = e.target.result;
+                    const newStudents = parseCSV(csvContent);
+                    
+                    if (newStudents.length > 0) {
+                        // This overwrites the current seating_chart document, 
+                        // setting the new names and resetting scores to 0.
+                        await initializeScores(newStudents); 
+                        alertModal("Arrangement Loaded", `Successfully loaded ${newStudents.length} seats from the file. Scores have been reset.`);
+                    }
+                } catch (error) {
+                    console.error("File processing error:", error);
+                    alertModal("File Error", `Failed to process CSV file: ${error.message}`);
+                }
+            };
+            reader.readAsText(file);
+        };
+
+
+        // --- UI RENDERING ---
+        const renderSeatingChart = () => {
+            const gridEl = document.getElementById('seating-grid');
+            if (!gridEl) return;
+            
+            gridEl.innerHTML = ''; // Clear previous content
+
+            // Create a list of all 36 seat IDs in order
+            const seatIdsInOrder = generateDefaultStudents().map(s => s.seatId);
+
+            seatIdsInOrder.forEach((seatId) => {
+                // Get data for this seat, falling back to a dummy structure if key is missing (shouldn't happen after init)
+                const data = currentScores[seatId] || { name: 'N/A', seat: parseInt(seatId.replace('R', '').replace('C', '')), score: 0 };
+                const score = data.score || 0;
+                const isAssigned = data.name !== 'N/A';
+                
+                let bgColor = isAssigned ? (score > 0 ? 'bg-indigo-300 hover:bg-indigo-400' : 'bg-white hover:bg-gray-100') : 'bg-gray-100 cursor-not-allowed';
+                let textColor = isAssigned ? 'text-gray-800' : 'text-gray-500';
+
+                const seatDiv = document.createElement('div');
+                seatDiv.className = `seat flex flex-col items-center justify-center p-3 sm:p-4 text-center rounded-lg ${bgColor} ${textColor} transition-colors border-2 border-indigo-400`;
+                seatDiv.setAttribute('data-seat-id', seatId);
+                
+                if (isAssigned) {
+                    seatDiv.onclick = () => window.updateScore(seatId);
+                } else {
+                    seatDiv.style.pointerEvents = 'none'; // Ensure unassigned seats cannot be clicked
+                }
+
+                seatDiv.innerHTML = `
+                    <p class="text-xs font-bold mb-1 break-words leading-tight sm:text-sm">${data.name}</p>
+                    <p class="text-xs sm:text-sm text-indigo-700 font-semibold">Seat: ${data.seat}</p>
+                    <p class="text-2xl sm:text-3xl font-extrabold ${isAssigned ? 'text-indigo-800' : 'text-gray-400'} mt-1">${isAssigned ? score : '--'}</p>
+                `;
+                gridEl.appendChild(seatDiv);
+            });
+        };
+        
+        // Initial render before data loads
+        document.addEventListener('DOMContentLoaded', renderSeatingChart);
+
+
+        // --- CSV EXPORT FUNCTIONALITY ---
+        const exportToCSV = () => {
+            if (!Object.keys(currentScores).length) {
+                alertModal("No Scores to Export", "The scores document is empty. Please ensure the app has loaded data before exporting.");
+                return;
+            }
+
+            // 1. Define the CSV header
+            const header = ["Seat Number", "Name", "Score"];
+            
+            // 2. Map the score object back to an array of rows using the default seat order
+            const studentsInOrder = generateDefaultStudents();
+            
+            const rows = studentsInOrder.map(defaultSeat => {
+                const data = currentScores[defaultSeat.seatId] || { name: 'N/A', seat: defaultSeat.seat, score: 0 };
+                return [
+                    data.seat,
+                    `"${data.name.replace(/"/g, '""')}"`, // Wrap name in quotes, escape existing quotes
+                    data.score
+                ].join(',');
+            });
+            
+            // 3. Combine header and rows
+            const csvContent = header.join(',') + '\n' + rows.join('\n');
+            
+            // 4. Create a Blob and trigger download
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            
+            // Generate filename with timestamp
+            const now = new Date();
+            const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
+            const timeStr = now.toTimeString().slice(0, 8).replace(/:/g, '');
+            link.setAttribute('href', url);
+            link.setAttribute('download', `Class_Scores_${dateStr}_${timeStr}.csv`);
+            
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            alertModal("Export Successful!", `Class scores exported to Class_Scores_${dateStr}_${timeStr}.csv.`);
+        };
+        
+        // --- Custom Alert Modal (instead of alert()) ---
+        function alertModal(title, message) {
+            const modal = document.getElementById('alert-modal');
+            document.getElementById('alert-title').textContent = title;
+            document.getElementById('alert-message').textContent = message;
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            
+            document.getElementById('alert-close').onclick = () => {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            };
+        }
+
+        // Expose functions globally for the buttons/elements
+        window.exportToCSV = exportToCSV;
+        window.handleFileLoad = handleFileLoad;
+        
+    </script>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-6xl mx-auto">
+        <header class="mb-8 text-center">
+            <h1 class="text-4xl font-extrabold text-gray-900">Class Participation Tracker</h1>
+            <p class="text-lg text-gray-600 mt-2">Click a seat to award 1 point for participation.</p>
+            <div id="status-message" class="mt-2 text-sm text-blue-600 font-medium">Status: Initializing...</div>
+            <div id="user-id" class="text-xs text-gray-500">User ID: N/A</div>
+        </header>
+
+        <!-- Configuration Section -->
+        <div class="bg-indigo-50 p-6 rounded-xl shadow-inner mb-8 border border-indigo-200">
+            <h2 class="text-xl font-semibold text-indigo-700 mb-4">Seating Arrangement Configuration</h2>
+            <p class="text-sm text-gray-600 mb-3">Upload a CSV file containing two columns: "Seat" (number 1-36) and "Name" (student's name). Seats not in the file will be treated as empty.</p>
+            
+            <div class="flex flex-col sm:flex-row gap-3">
+                <input type="file" id="csv-file-input" accept=".csv" class="flex-grow file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-100 file:text-indigo-700 hover:file:bg-indigo-200 border border-gray-300 rounded-lg p-1.5 focus:ring-indigo-500 focus:border-indigo-500 text-gray-700">
+                <button id="load-arrangement-btn"
+                    class="px-6 py-2 bg-indigo-600 text-white font-bold rounded-lg shadow-md hover:bg-indigo-700 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 disabled:opacity-50"
+                    >
+                    Load Arrangement
+                </button>
+            </div>
+        </div>
+
+
+        <!-- Seating Grid Container (6x6) -->
+        <div id="seating-grid" class="grid grid-cols-6 gap-2 sm:gap-4 p-4 bg-white rounded-xl shadow-2xl border-4 border-indigo-500/50">
+            <!-- Seat divs will be dynamically injected here by renderSeatingChart() -->
+            <div class="col-span-6 text-center text-gray-500 p-8">Loading seating chart...</div>
+        </div>
+
+        <!-- Action Button -->
+        <div class="mt-8 flex justify-center">
+            <button id="dismiss-btn"
+                class="px-8 py-3 bg-red-600 text-white font-bold rounded-full shadow-lg hover:bg-red-700 transition-all transform hover:scale-105 active:scale-100 focus:outline-none focus:ring-4 focus:ring-red-500 focus:ring-opacity-50 disabled:opacity-50"
+                aria-label="Export scores and mark class dismissed"
+                >
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 inline-block mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                </svg>
+                Class Dismissed (Export Scores)
+            </button>
+        </div>
+    </div>
+    
+    <!-- Custom Alert Modal -->
+    <div id="alert-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 z-50 justify-center items-center">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full transform transition-all duration-300 scale-100">
+            <h3 id="alert-title" class="text-xl font-bold text-gray-900 mb-4">Alert</h3>
+            <p id="alert-message" class="text-gray-700 mb-6"></p>
+            <button id="alert-close" class="w-full bg-indigo-600 text-white py-2 rounded-lg font-semibold hover:bg-indigo-700 transition-colors">
+                OK
+            </button>
+        </div>
+    </div>
+
+</body>
+</html>
